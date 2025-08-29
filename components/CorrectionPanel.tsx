@@ -11,6 +11,8 @@ import { UploadIcon, PlusIcon, TrashIcon, CheckIcon, QuestionMarkCircleIcon, Arr
 import { validateImageFile } from '../lib/fileValidation';
 import { submitCorrection } from '../lib/form';
 import { WORKER_URL } from '../config/runtime';
+import { classifyPatch } from '../utils/classifyPatch';
+import type { WorkerMetadata, CorrectionPair } from '../types';
 
 type CorrectionMode = 'auto' | 'extract' | 'generate';
 
@@ -277,25 +279,68 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
             throw new Error("Please paint on both the source and reference images with the same color to link correction areas.");
         }
         
-        // 1. Prepare mask blobs for each paired color
+        console.log(`[BadRobot] Preparing ${validPairedColors.length} correction pair(s).`);
+
+        // 1. Build metadata and prepare mask blobs simultaneously
         const sourceMasks: Blob[] = [];
         const referenceMasks: Blob[] = [];
+        const pairs: CorrectionPair[] = [];
+
         for (const color of validPairedColors) {
             const sourceMask = await sourceCanvasRef.current.getMaskPNG(color);
             const refMask = await refCanvasRef.current.getMaskPNG(color);
-            if (sourceMask && refMask) {
-                sourceMasks.push(sourceMask);
-                referenceMasks.push(refMask);
-            } else {
-                console.warn(`Skipping incomplete mask pair for color ${color}`);
-            }
-        }
 
-        if (sourceMasks.length === 0) {
+            if (!sourceMask || !refMask) {
+                console.warn(`Skipping incomplete mask pair for color ${color}`);
+                continue;
+            }
+
+            // Get method, auto-classifying if needed
+            const userSelectedMode = correctionModes.get(color) || 'auto';
+            let finalMethod: 'extract' | 'generate' = 'generate'; // Default
+
+            if (userSelectedMode === 'extract' || userSelectedMode === 'generate') {
+                finalMethod = userSelectedMode;
+            } else { // 'auto'
+                console.log(`[BadRobot] Auto-classifying patch for color ${color}`);
+                const patchB64 = await sourceCanvasRef.current.extractPatchForColor(color);
+                if (patchB64) {
+                    const classification = await classifyPatch(patchB64);
+                    finalMethod = classification.route === 'copy_exact' ? 'extract' : 'generate';
+                    console.log(`[BadRobot] Auto-classified as: ${finalMethod} (Confidence: ${classification.confidence})`);
+                } else {
+                    console.warn(`Could not extract patch for color ${color}, defaulting to 'generate'`);
+                }
+            }
+
+            // Get bounding boxes
+            const sourceBBox = sourceCanvasRef.current.getMaskBBox(color);
+            const referenceBBox = refCanvasRef.current.getMaskBBox(color);
+
+            pairs.push({
+                colorId: color,
+                method: finalMethod,
+                sourceBBox,
+                referenceBBox,
+            });
+
+            sourceMasks.push(sourceMask);
+            referenceMasks.push(refMask);
+        }
+        
+        if (pairs.length === 0) {
             throw new Error("No valid, complete mask pairs were generated. Ensure you paint on both images with the same color.");
         }
 
-        console.log(`[BadRobot] Submitting correction with ${sourceMasks.length} mask pair(s).`);
+        const metadata: WorkerMetadata = {
+            width: W,
+            height: H,
+            enforceFixedCanvas: true,
+            sequential: true,
+            pairs: pairs,
+        };
+
+        console.log(`[BadRobot] Submitting correction with metadata:`, metadata);
 
         // 2. Call the worker via the new helper
         const resultBlob = await submitCorrection({
@@ -304,6 +349,7 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
             referenceFile: referenceImage,
             sourceMasks: sourceMasks,
             referenceMasks: referenceMasks,
+            metadata: metadata,
         });
 
         // 3. Process the returned image

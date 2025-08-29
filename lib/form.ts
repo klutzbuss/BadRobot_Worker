@@ -2,6 +2,7 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
 */
+import type { WorkerMetadata } from '../types';
 
 /**
  * A single place to build the payload exactly as the worker expects and
@@ -14,6 +15,7 @@ export async function submitCorrection({
   referenceFile,     // File|Blob – the clean/reference image
   sourceMasks,       // Array<File|Blob> – masks drawn on distorted image
   referenceMasks,    // Array<File|Blob> – masks drawn on reference image
+  metadata,          // The JSON metadata for the worker
   signal,
 }: {
   workerUrl: string;
@@ -21,20 +23,28 @@ export async function submitCorrection({
   referenceFile: File | Blob;
   sourceMasks: Array<File | Blob>;
   referenceMasks: Array<File | Blob>;
+  metadata: WorkerMetadata;
   signal?: AbortSignal;
 }) {
   const form = new FormData();
+
+  // Part 1: Metadata
+  const metadataJson = JSON.stringify(metadata);
+  const metadataBlob = new Blob([metadataJson], { type: 'application/json' });
+  form.append('metadata', metadataBlob, 'metadata.json');
 
   // EXACT FIELD NAMES THE WORKER EXPECTS:
   form.append('source_image', distortedFile, 'source.png');
   form.append('reference_image', referenceFile, 'reference.png');
 
-  // Append masks using the required indexed names
+  // Append masks using the required indexed names and color-coded filenames
   sourceMasks.forEach((m, i) => {
-    form.append(`source_mask_${i}`, m, `source_mask_${i}.png`);
+    const colorId = metadata.pairs[i]?.colorId.replace('#', '') || i;
+    form.append(`source_mask_${i}`, m, `source_mask_${colorId}.png`);
   });
   referenceMasks.forEach((m, i) => {
-    form.append(`reference_mask_${i}`, m, `reference_mask_${i}.png`);
+    const colorId = metadata.pairs[i]?.colorId.replace('#', '') || i;
+    form.append(`reference_mask_${i}`, m, `reference_mask_${colorId}.png`);
   });
 
   // Debug: log what we are sending

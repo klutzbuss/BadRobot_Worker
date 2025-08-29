@@ -63,7 +63,7 @@ function toPNG(buffer) {
   return sharp(buffer).png().toBuffer();
 }
 
-const allowedField = /^(source_image|reference_image|source_mask_\d+|reference_mask_\d+)$/;
+const allowedField = /^(metadata|source_image|reference_image|source_mask_\d+|reference_mask_\d+)$/;
 
 function getOne(files, name) {
   return files.find(f => f.fieldname === name);
@@ -87,6 +87,7 @@ app.post("/process", upload.any(), async (req, res, next) => {
     console.log("---- /process request ----");
     
     const files = req.files || [];
+    console.log("Metadata field:", req.files.find(f => f.fieldname === "metadata"));
 
     // Validate that all uploaded field names are allowed
     for (const f of files) {
