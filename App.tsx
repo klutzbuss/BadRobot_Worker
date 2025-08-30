@@ -12,6 +12,7 @@ import AddProductPanel from './components/AddProductPanel';
 import CorrectionPanel, { CorrectionPanelRef, CorrectionHistoryState } from './components/CorrectionPanel';
 import { UndoIcon, RedoIcon, EyeIcon } from './components/icons';
 import StartScreen from './components/StartScreen';
+import ResultScreen from './components/ResultScreen';
 import { validateImageFile } from './lib/fileValidation';
 
 // Helper to convert a data URL string to a File object
@@ -32,6 +33,7 @@ const dataURLtoFile = (dataurl: string, filename: string): File => {
 }
 
 type Tab = 'addProduct' | 'correction';
+type View = 'editing' | 'result';
 
 const App: React.FC = () => {
   const [history, setHistory] = useState<File[]>([]);
@@ -41,6 +43,8 @@ const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>('addProduct');
   const [correctionHistory, setCorrectionHistory] = useState<CorrectionHistoryState>({ canUndo: false, canRedo: false });
   const [hasReferenceImage, setHasReferenceImage] = useState<boolean>(false);
+  const [view, setView] = useState<View>('editing');
+  const [resultUrl, setResultUrl] = useState<string | null>(null);
   
   const correctionPanelRef = useRef<CorrectionPanelRef>(null);
 
@@ -191,6 +195,26 @@ const App: React.FC = () => {
       );
     }
 
+    if (view === 'result' && resultUrl) {
+      return (
+        <ResultScreen
+          resultUrl={resultUrl}
+          onBack={() => setView('editing')}
+          onStartOver={() => {
+            setResultUrl(null);
+            setView('editing');
+            setActiveTab('addProduct');
+            if (history.length > 0) {
+              const firstImage = history[0];
+              setHistory([firstImage]);
+              setHistoryIndex(0);
+            }
+            correctionPanelRef.current?.reset();
+          }}
+        />
+      );
+    }
+
     const showMainImage = activeTab === 'addProduct' || (activeTab === 'correction' && !hasReferenceImage);
 
     const imageDisplay = (
@@ -243,7 +267,10 @@ const App: React.FC = () => {
                   ref={correctionPanelRef}
                   sourceImage={currentImage}
                   sourceImageUrl={currentImageUrl}
-                  onCorrected={addImageToHistory} 
+                  onCorrectionReady={(url: string) => {
+                    setResultUrl(url);
+                    setView('result');
+                  }}
                   onError={setError}
                   onHistoryUpdate={setCorrectionHistory}
                   onReferenceImageUpload={setHasReferenceImage}

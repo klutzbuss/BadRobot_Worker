@@ -6,8 +6,7 @@
 import React, { useState, useRef, useCallback, useEffect, useImperativeHandle, forwardRef, useMemo } from 'react';
 import PaintCanvas, { CanvasRef } from './PaintCanvas';
 import Spinner from './Spinner';
-import ComparisonSlider from './ComparisonSlider';
-import { UploadIcon, PlusIcon, TrashIcon, CheckIcon, QuestionMarkCircleIcon, ArrowLeftIcon } from './icons';
+import { UploadIcon, PlusIcon, TrashIcon, CheckIcon, QuestionMarkCircleIcon } from './icons';
 import { validateImageFile } from '../lib/fileValidation';
 import { submitCorrection } from '../lib/form';
 import { WORKER_URL } from '../config/runtime';
@@ -46,7 +45,7 @@ const MORE_COLORS = [
 interface CorrectionPanelProps {
   sourceImage: File;
   sourceImageUrl: string;
-  onCorrected: (file: File) => void;
+  onCorrectionReady: (url: string) => void;
   onError: (error: string) => void;
   onHistoryUpdate: (state: CorrectionHistoryState) => void;
   onReferenceImageUpload: (hasReference: boolean) => void;
@@ -59,7 +58,7 @@ export interface CorrectionPanelRef {
     redo: () => void;
 }
 
-const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ sourceImage, sourceImageUrl, onCorrected, onError, onHistoryUpdate, onReferenceImageUpload, onReplaceSourceImage }, ref) => {
+const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ sourceImage, sourceImageUrl, onCorrectionReady, onError, onHistoryUpdate, onReferenceImageUpload, onReplaceSourceImage }, ref) => {
   const [referenceImage, setReferenceImage] = useState<File | null>(null);
   const [referenceImageUrl, setReferenceImageUrl] = useState<string | null>(null);
   const [colors, setColors] = useState(INITIAL_COLORS);
@@ -70,29 +69,16 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
   const [refActiveColors, setRefActiveColors] = useState<Set<string>>(new Set());
 
   const [isLoading, setIsLoading] = useState(false);
-  const [correctedImageUrl, setCorrectedImageUrl] = useState<string | null>(null);
-  const [compare, setCompare] = useState<{ before: string; after: string } | null>(null);
   const [brushSize, setBrushSize] = useState(30);
   const [isColorPickerOpen, setIsColorPickerOpen] = useState(false);
   const [lastPaintedCanvas, setLastPaintedCanvas] = useState<'source' | 'ref' | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
-  const [isBlinking, setIsBlinking] = useState(false);
   const [outputSizeStatus, setOutputSizeStatus] = useState<{w: number, h: number, ok: boolean} | null>(null);
 
   const colorPickerRef = useRef<HTMLDivElement>(null);
   const brushSliderRef = useRef<HTMLInputElement>(null);
   const sourceCanvasRef = useRef<CanvasRef>(null);
   const refCanvasRef = useRef<CanvasRef>(null);
-  const blinkIntervalRef = useRef<number | null>(null);
-
-  // Revoke object URL on change or unmount to prevent memory leaks
-  useEffect(() => {
-    return () => {
-      if (correctedImageUrl) {
-        URL.revokeObjectURL(correctedImageUrl);
-      }
-    };
-  }, [correctedImageUrl]);
 
   const updateParentHistory = useCallback(() => {
     const sourceHistory = sourceCanvasRef.current?.getHistoryState() ?? { canUndo: false, canRedo: false };
@@ -119,11 +105,6 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
     reset: () => {
         sourceCanvasRef.current?.clearCanvas();
         refCanvasRef.current?.clearCanvas();
-        if (correctedImageUrl) {
-            URL.revokeObjectURL(correctedImageUrl);
-        }
-        setCorrectedImageUrl(null);
-        setCompare(null);
         setOutputSizeStatus(null);
     },
     undo: () => {
@@ -182,25 +163,6 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
         onReferenceImageUpload(false);
     }
   }, [referenceImage, onReferenceImageUpload]);
-
-  // Blinking effect
-  useEffect(() => {
-    if (isBlinking && correctedImageUrl) {
-        const afterImage = document.querySelector('[alt="After"]')?.parentElement;
-        if (afterImage) {
-            let visible = true;
-            blinkIntervalRef.current = window.setInterval(() => {
-                (afterImage as HTMLElement).style.visibility = visible ? 'hidden' : 'visible';
-                visible = !visible;
-            }, 333); // ~3Hz
-        }
-    }
-    return () => {
-        if (blinkIntervalRef.current) clearInterval(blinkIntervalRef.current);
-        const afterImage = document.querySelector('[alt="After"]')?.parentElement;
-        if (afterImage) (afterImage as HTMLElement).style.visibility = 'visible';
-    }
-  }, [isBlinking, correctedImageUrl]);
   
   const handleFileSelect = (file: File | null) => {
     if (file) {
@@ -272,14 +234,6 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
         return;
     }
     
-    // Clear previous results before starting
-    if (correctedImageUrl) {
-        URL.revokeObjectURL(correctedImageUrl);
-    }
-    setCorrectedImageUrl(null);
-    setCompare(null);
-    setIsBlinking(false);
-
     setIsLoading(true);
     onError("");
     setOutputSizeStatus(null);
@@ -370,20 +324,17 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
 
         // 3. Process the returned image
         const correctedUrl = URL.createObjectURL(resultBlob);
-        setCorrectedImageUrl(correctedUrl);
-        setCompare({ before: sourceImageUrl, after: correctedUrl });
         
         const resultImg = await loadImage(correctedUrl);
         const ok = resultImg.naturalWidth === W && resultImg.naturalHeight === H;
         setOutputSizeStatus({ w: resultImg.naturalWidth, h: resultImg.naturalHeight, ok });
         
         if (!ok) {
+            URL.revokeObjectURL(correctedUrl); // Clean up
             throw new Error(`Dimension mismatch: Expected ${W}x${H}, but received ${resultImg.naturalWidth}x${resultImg.naturalHeight}.`);
         }
         
-        const finalFile = new File([resultBlob], `corrected-${Date.now()}.png`, { type: 'image/png' });
-        
-        onCorrected(finalFile);
+        onCorrectionReady(correctedUrl);
 
     } catch (err) {
         const msg = err instanceof Error ? err.message : "An unknown error occurred during correction.";
@@ -393,18 +344,6 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
     }
   };
   
-    const handleDownload = () => {
-      if (correctedImageUrl) {
-          const a = document.createElement("a");
-          a.href = correctedImageUrl;
-          a.download = "corrected.png";
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          console.log("[BadRobot] Downloaded corrected.png");
-      }
-  };
-
   return (
     <div className="w-full flex flex-col items-center gap-4 animate-fade-in relative">
       {isLoading && (
@@ -546,37 +485,6 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
                   )}
                 </div>
             </div>
-
-            {correctedImageUrl && (
-                <div className="w-full max-w-4xl flex flex-col items-center gap-4 animate-fade-in mt-6 border-t border-gray-700 pt-6">
-                    <h2 className="text-2xl font-bold">Correction Complete</h2>
-                    <div className="w-full relative">
-                        <div className="relative w-full h-full max-h-[70vh]">
-                            <ComparisonSlider beforeUrl={sourceImageUrl} afterUrl={correctedImageUrl} />
-                        </div>
-                    </div>
-                    <div className="flex items-center gap-4">
-                        <button 
-                            onClick={() => {
-                                if (!compare) return;
-                                console.log("[BadRobot] Blink compare", compare);
-                                setIsBlinking(prev => !prev);
-                            }}
-                            disabled={!compare}
-                            className={`font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out text-base ${isBlinking ? 'bg-blue-500 text-white' : 'bg-white/10 text-gray-200 hover:bg-white/20'} disabled:opacity-50 disabled:cursor-not-allowed`}
-                        >
-                            Blink Compare
-                        </button>
-                        <button 
-                            onClick={handleDownload}
-                            disabled={!correctedImageUrl}
-                            className="bg-gradient-to-br from-green-600 to-green-500 text-white font-bold py-3 px-5 rounded-md transition-all duration-300 ease-in-out shadow-lg shadow-green-500/20 hover:shadow-xl hover:shadow-green-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner text-base disabled:from-gray-600 disabled:to-gray-700 disabled:shadow-none disabled:cursor-not-allowed disabled:transform-none"
-                        >
-                            Download Image
-                        </button>
-                    </div>
-                </div>
-            )}
         </>
       )}
     </div>
