@@ -1,103 +1,86 @@
-# External Worker Specification (`/process`)
+# System Goal: Correction Engine
 
-This document outlines the API contract and responsibilities for the external worker that handles the complex image processing tasks for the BadRobot application.
+You are the “Correction Engine” for an image-to-image patchwork editor.
 
-## Endpoint
+**Given:**
+- a source (distorted) product image
+- a reference (clean) design image
+- 1–5 paired masks linking a region in the source to a corresponding region in the reference
 
-- **URL**: Configured via an environment variable (e.g., `WORKER_URL`) in the main web app.
-- **Method**: `POST`
-- **Content-Type**: `multipart/form-data`
+**Produce:** a corrected image that:
+- fixes small, detailed distortions (especially brand text/logos and badges),
+- strictly preserves the original source width/height & aspect,
+- blends corrections seamlessly into the garment/scene, while keeping the rest of the image unchanged.
 
-## Request Payload (`multipart/form-data`)
+## Inputs (always provided by the app / worker)
 
-The request will contain the following parts:
+- `source_image`: the distorted product image (PNG or JPEG).
+- `reference_image`: the clean design (PNG or JPEG).
+- Up to five paired masks named as:
+  - `source_mask_1`, `reference_mask_1`
+  - `source_mask_2`, `reference_mask_2`
+  - …
+  - `source_mask_5`, `reference_mask_5`
 
-1.  **`metadata`** (Part 1, `application/json`)
-    -   A JSON blob containing the overall job configuration.
-    -   **Format**:
-        ```json
-        {
-          "width": 1024,
-          "height": 1024,
-          "enforceFixedCanvas": true,
-          "sequential": true,
-          "pairs": [
-            {
-              "colorId": "#ef4444",
-              "method": "extract", // "extract" or "generate" (after auto-routing)
-              "sourceBBox": { "x": 100, "y": 150, "w": 300, "h": 250 },
-              "referenceBBox": { "x": 50, "y": 80, "w": 320, "h": 260 }
-            }
-            // ... more pairs
-          ]
-        }
-        ```
+Masks are binary or soft alpha mattes (white = selected). Each `source_mask_i` and `reference_mask_i` form a linked pair (same color intent in the UI).
 
-2.  **`source_image`** (Part 2, `image/*`)
-    -   The original, full-size source image file (e.g., the t-shirt).
+## Hard requirements
 
-3.  **`reference_image`** (Part 3, `image/*`)
-    -   The original, full-size reference image file (e.g., the clean design).
+- Output exactly the same pixel size as `source_image`. Do not crop, pad, or change aspect ratio.
+- Apply edits only inside the union of source masks. Outside masked regions, the image must remain bit-identical to the source (except for unavoidable global blending).
+- Treat text and logos as critical: spacing, letter forms, kerning, alignment, stroke weight, and brand marks must be faithful to the reference. No hallucinated glyphs, no misspellings.
+- Naturalize lighting/fabric: respect shirt folds, texture, and grain; keep shadows/highlights plausible after correction.
+- If a pair lacks usable detail (e.g., reference is too small/noisy), prefer reference-guided inpainting over literal copy/paste so results look printed on the garment, not stickered on top.
 
-4.  **`source_mask_{index}`** (Part 4+, `image/png`)
-    -   The 8-bit PNG mask for the source image for the pair at `metadata.pairs[index]`.
-    -   The filename will be `source_mask_{colorId}.png`.
+## Strategy to follow per pair (i = 1..5)
 
-5.  **`reference_mask_{index}`** (Part 5+, `image/png`)
-    -   The 8-bit PNG mask for the reference image for the pair at `metadata.pairs[index]`.
-    -   The filename will be `reference_mask_{colorId}.png`.
+1.  **Understand content type in the masked region:**
+    -   If it contains text / vector-like logo → treat as **Exact-Match Mode**.
+    -   Else (shapes, badges w/ texture) → use **Style-Match Mode**.
 
-## Worker Responsibilities
+2.  **Exact-Match Mode (brand text, logos)**
+    -   Use the `reference_mask_i` patch as the semantic ground truth for geometry, spacing, and glyph shapes.
+    -   Warp the reference patch gently (perspective/affine) to fit the garment pose in the `source_mask_i`.
+    -   Re-render edges crisply and anti-aliased; avoid moiré.
+    -   Maintain the source garment’s lighting and micro-texture (do not flatten the shirt).
+    -   If warping would introduce artifacts, regenerate the region with reference-guided inpainting conditioned on the reference patch features, then blend.
 
-### 1. Pre-processing (Fixed-Canvas Contract)
+3.  **Style-Match Mode (badges, pattern fills)**
+    -   Transfer color/material/design from `reference_mask_i` into `source_mask_i`.
+    -   Match local contrast and grain to the surrounding shirt.
+    -   Keep edges faithful to the source selection and avoid halos.
 
--   Read the `width` (W) and `height` (H) from the metadata.
--   Calculate `S = max(W, H)`.
--   Create a new `S x S` transparent canvas.
--   Center-pad the `source_image` onto this canvas. This padded canvas becomes the "working canvas" for all sequential operations.
+## Compositing
 
-### 2. Sequential Pair Processing
+-   Edit each pair independently; then alpha-composite back into the source.
+-   Use edge-aware feathering confined to a 1–3px band inside the mask to avoid halos while preserving sharp design edges.
 
--   Iterate through the `pairs` array in the order it is received.
--   For each pair, perform the operation specified by its `method`.
+## Quality checks before returning
 
-#### Method: `extract` (for text, logos)
+-   **Text fidelity check** (if any text/logos were corrected): letters must read clearly at 100% zoom; spacing is even; no bent baselines unless present in the reference.
+-   **Seam check**: no hard cut borders, no mismatched noise.
+-   **Global integrity**: everything outside masks should be unchanged.
 
-1.  **Crop Patches**: Using the `sourceBBox` and `referenceBBox`, crop the corresponding regions from the full-size `source_image` and `reference_image`.
-2.  **Geometric Fit**: Estimate a transformation (e.g., Homography, Thin Plate Spline) to warp the reference patch to the perspective of the source patch. Use keypoints (e.g., SIFT, ORB) detected *only within the masked areas* of the patches to guide the warp.
-3.  **Photometric Match**: Perform color correction on the warped reference patch to match the lighting and color profile of the source patch. A Reinhard LAB color transfer using pixels from a "ring" around the source patch is recommended.
-4.  **Seamless Blending**: Use a Poisson blend (`cv2.seamlessClone`) to insert the color-matched, warped patch back into the "working canvas" at the `sourceBBox` location. Use a feather of 2-4 pixels.
-5.  **(Optional) Polish**: Perform a low-denoising pass using an image-to-image model (like Nano-Banana) on the blended patch with a prompt like: "Enhance edges and clarity only. Do not change layout, size, or boundaries. Preserve the underlying fabric texture."
+## Output format
 
-#### Method: `generate` (for textures, decals)
+-   Return a PNG with the same width/height as `source_image`.
+-   Include these fields in your JSON if the tool asks for structured output:
+    ```json
+    {
+      "mime_type": "image/png",
+      "keep_dimensions": "match_source",
+      "notes": "masks_applied:n, text_fidelity:pass|warn"
+    }
+    ```
 
-1.  **Crop Patches**: Crop the source patch using `sourceBBox` from the "working canvas" and the reference patch using `referenceBBox` from the `reference_image`.
-2.  **AI Inpainting**: Call an image editing model (e.g., Gemini / Nano-Banana) with the source crop as the base image, the reference crop as the style reference, and a prompt like: "Redraw only this crop to match the reference decal and color. Do not resize or move elements. Preserve surrounding fabric lighting and weave. The output must be the identical crop size."
-3.  **Seamless Blending**: Use a Poisson blend to reinsert the AI-generated patch back into the "working canvas" at the `sourceBBox` location.
+## Failure / re-try policy
 
-### 3. Post-processing
+-   If a region still shows text warping, re-attempt that region with stronger geometry constraints.
+-   If the reference patch is unusable (too low-res), upscale the semantics, not the pixels: regenerate crisp vector-like glyphs that exactly match the reference wording and typography.
+-   Never invent new wording or change brand names.
 
--   After processing all pairs, crop the `S x S` "working canvas" back to the original `W x H` dimensions.
--   The crop must be taken from the center to reverse the initial padding.
+## Examples of what NOT to do
 
-## Response
-
--   **Success**:
-    -   **Status Code**: `200 OK`
-    -   **Content-Type**: `image/png`
-    -   **Body**: The final, corrected image file at the original `W x H` resolution.
--   **Failure**:
-    -   **Status Code**: `4xx` or `5xx`
-    -   **Content-Type**: `application/json`
-    -   **Body**:
-        ```json
-        {
-          "error": "A descriptive error message."
-        }
-        ```
-
-## Required Libraries (Node.js Example)
-
--   `sharp`: For fast image I/O, padding, and cropping.
--   `opencv4nodejs`: For computer vision tasks like `seamlessClone`, keypoint detection, and homography.
--   `@google/generative-ai` or `axios`/`node-fetch`: For making calls to the Gemini API for the `generate` method.
+-   Do not paste a rectangular chunk of the reference over the shirt.
+-   Do not change garment folds or color globally.
+-   Do not crop, resize, or pad the final image.
