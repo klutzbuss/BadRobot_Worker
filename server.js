@@ -7,223 +7,226 @@ import express from "express";
 import multer from "multer";
 import cors from "cors";
 import sharp from "sharp";
-import Jimp from "jimp";
+import { GoogleGenAI, Modality } from "@google/genai";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
-// util: get bbox (x,y,w,h) of opaque pixels (mask: white = selected)
-async function maskBBox(maskImg) {
-  const { width, height, data } = maskImg.bitmap; // RGBA
-  let minX = width, minY = height, maxX = -1, maxY = -1;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = (y * width + x) * 4;
-      // consider pixel selected if any channel is bright (mask may be white)
-      const v = Math.max(data[idx], data[idx + 1], data[idx + 2]);
-      if (v > 128) {
-        if (x < minX) minX = x;
-        if (y < minY) minY = y;
-        if (x > maxX) maxX = x;
-        if (y > maxY) maxY = y;
-      }
+const COLORS = ['red', 'green', 'blue', 'yellow', 'cyan'];
+
+// --- Multer Setup ---
+const multerFields = [
+  { name: 'source_image', maxCount: 1 },
+  { name: 'reference_image', maxCount: 1 },
+];
+COLORS.forEach(color => {
+  multerFields.push({ name: `source_mask_${color}`, maxCount: 1 });
+  multerFields.push({ name: `reference_mask_${color}`, maxCount: 1 });
+});
+const upload = multer({ 
+    storage: multer.memoryStorage(), 
+    limits: { fileSize: 25 * 1024 * 1024 } 
+}).fields(multerFields);
+
+
+// --- Gemini AI Setup ---
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+const geminiModel = 'gemini-2.5-flash-image-preview';
+
+
+// --- Image Processing & Validation Helpers ---
+
+/**
+ * Counts the number of separate connected components (blobs) in a mask image.
+ * @param {Buffer} buffer The image buffer for the mask.
+ * @returns {Promise<number>} The number of blobs found.
+ */
+async function countBlobs(buffer) {
+    try {
+        const image = sharp(buffer);
+        const { data, info } = await image.raw().toBuffer({ resolveWithObject: true });
+        const { width, height, channels } = info;
+        const visited = new Uint8Array(width * height);
+        let blobCount = 0;
+
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const index = y * width + x;
+                const pixelIsMarked = data[index * channels] > 128; // Check R channel for white
+
+                if (pixelIsMarked && visited[index] === 0) {
+                    blobCount++;
+                    const queue = [[x, y]];
+                    visited[index] = 1;
+                    while (queue.length > 0) {
+                        const [cx, cy] = queue.shift();
+                        const neighbors = [[cx, cy - 1], [cx, cy + 1], [cx - 1, cy], [cx + 1, cy]];
+                        for (const [nx, ny] of neighbors) {
+                            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                                const nIndex = ny * width + nx;
+                                if (visited[nIndex] === 0 && data[nIndex * channels] > 128) {
+                                    visited[nIndex] = 1;
+                                    queue.push([nx, ny]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return blobCount;
+    } catch (error) {
+        console.error("Error in countBlobs:", error);
+        return -1; // Indicate an error
     }
-  }
-  if (maxX < 0) return null;
-  return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
-}
-
-// util: feather mask (gaussian blur)
-async function featherMask(mask, radius = 6) {
-  const png = await mask.getBufferAsync(Jimp.MIME_PNG);
-  const blurred = await Jimp.read(png);
-  blurred.gaussian(radius);
-  return blurred;
 }
 
 // Error helpers
-function badRequest(message) {
-  const err = new Error(message);
+function badRequest(detail, error = "Bad Request") {
+  const err = new Error(error);
   err.status = 400;
+  err.detail = detail;
   return err;
 }
-function unsupported(message) {
-    const err = new Error(message);
-    err.status = 415;
-    return err;
-}
 
-// Allowed MIME types
-const okTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
+// --- Express Routes ---
 
-// Normalize any image buffer to a PNG buffer
-function toPNG(buffer) {
-  return sharp(buffer).png().toBuffer();
-}
+app.get("/", (_req, res) => res.send("BadRobot AI worker is running. Use POST /process to submit a job."));
 
-const allowedField = /^(metadata|source_image|reference_image|source_mask_\d+|reference_mask_\d+)$/;
+app.post("/process", (req, res, next) => {
+    upload(req, res, async (err) => {
+        if (err) return next(err); // Forward multer errors
+        try {
+            console.log("---- /process request ----");
+            const files = req.files;
 
-function getOne(files, name) {
-  return files.find(f => f.fieldname === name);
-}
+            // 1. === Basic Validation ===
+            if (!files.source_image?.[0]) throw badRequest("Missing required file: source_image");
+            if (!files.reference_image?.[0]) throw badRequest("Missing required file: reference_image");
 
-function listMaskArray(files, prefix) {
-  const list = files
-    .filter(f => f.fieldname.startsWith(prefix))
-    .sort((a, b) => {
-      const ai = parseInt(a.fieldname.split("_").pop() || "0", 10);
-      const bi = parseInt(b.fieldname.split("_").pop() || "0", 10);
-      return ai - bi;
+            const sourceImageFile = files.source_image[0];
+            const referenceImageFile = files.reference_image[0];
+            
+            const usedColors = COLORS.filter(c => files[`source_mask_${c}`] || files[`reference_mask_${c}`]);
+
+            if (usedColors.length === 0) {
+                throw badRequest("No masks provided. Please paint at least one color on both images.");
+            }
+
+            // 2. === Per-Color Mask Validation ===
+            for (const color of usedColors) {
+                const sourceMaskFile = files[`source_mask_${color}`]?.[0];
+                const refMaskFile = files[`reference_mask_${color}`]?.[0];
+                
+                if (!sourceMaskFile || !refMaskFile) {
+                    throw badRequest(`Missing masks for color '${color}'. Need both source_mask_${color} and reference_mask_${color}.`);
+                }
+                
+                const sourceBlobCount = await countBlobs(sourceMaskFile.buffer);
+                if (sourceBlobCount !== 1) {
+                    throw badRequest(`Invalid mask: Color '${color}' must contain exactly one region on the source canvas, but found ${sourceBlobCount}.`);
+                }
+
+                const refBlobCount = await countBlobs(refMaskFile.buffer);
+                if (refBlobCount !== 1) {
+                    throw badRequest(`Invalid mask: Color '${color}' must contain exactly one region on the reference canvas, but found ${refBlobCount}.`);
+                }
+            }
+
+            // 3. === AI Processing Pipeline ===
+            let workingCanvas = sharp(sourceImageFile.buffer);
+            const sourceMeta = await workingCanvas.metadata();
+
+            for (const color of usedColors) {
+                console.log(`Processing color: ${color}`);
+                const sourceMask = sharp(files[`source_mask_${color}`][0].buffer);
+                const referenceMask = sharp(files[`reference_mask_${color}`][0].buffer);
+
+                // Get bounding boxes
+                const sourceStats = await sourceMask.stats();
+                const refStats = await referenceMask.stats();
+                
+                // dominant will be white, so we can get its coordinates
+                const sourceCrop = { left: sourceStats.channels[0].minX, top: sourceStats.channels[0].minY, width: sourceStats.channels[0].maxX - sourceStats.channels[0].minX + 1, height: sourceStats.channels[0].maxY - sourceStats.channels[0].minY + 1 };
+                const refCrop = { left: refStats.channels[0].minX, top: refStats.channels[0].minY, width: refStats.channels[0].maxX - refStats.channels[0].minX + 1, height: refStats.channels[0].maxY - refStats.channels[0].minY + 1 };
+                
+                // Pad bboxes slightly
+                const padding = 8;
+                sourceCrop.left = Math.max(0, sourceCrop.left - padding);
+                sourceCrop.top = Math.max(0, sourceCrop.top - padding);
+                sourceCrop.width = Math.min(sourceMeta.width - sourceCrop.left, sourceCrop.width + padding * 2);
+                sourceCrop.height = Math.min(sourceMeta.height - sourceCrop.top, sourceCrop.height + padding * 2);
+
+                // Crop patches
+                const sourcePatchBuffer = await workingCanvas.clone().extract(sourceCrop).png().toBuffer();
+                const refPatchBuffer = await sharp(referenceImageFile.buffer).extract(refCrop).png().toBuffer();
+                const sourceMaskCropBuffer = await sourceMask.extract(sourceCrop).png().toBuffer();
+
+                // Call Gemini
+                const prompt = "Recreate the content from the reference patch and realistically adapt it into the source patch region. Preserve shirt/fabric geometry, wrinkles, perspective, and local lighting/shadows. Confine changes to the masked region only; do not alter the surrounding pixels.";
+                
+                const response = await ai.models.generateContent({
+                    model: geminiModel,
+                    contents: {
+                        parts: [
+                            { text: prompt },
+                            { inlineData: { mimeType: 'image/png', data: sourcePatchBuffer.toString('base64') } },
+                            { inlineData: { mimeType: 'image/png', data: sourceMaskCropBuffer.toString('base64') } },
+                            { inlineData: { mimeType: 'image/png', data: refPatchBuffer.toString('base64') } },
+                        ]
+                    },
+                    config: { responseModalities: [Modality.IMAGE] }
+                });
+
+                const imagePart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
+                if (!imagePart?.inlineData) {
+                    const feedback = response.promptFeedback || response.candidates?.[0]?.finishReason;
+                    throw new Error(`AI did not return an image for color '${color}'. Reason: ${JSON.stringify(feedback)}`);
+                }
+
+                const generatedPatchBuffer = Buffer.from(imagePart.inlineData.data, 'base64');
+
+                // Feather mask and composite back
+                const featheredMask = await sharp(sourceMaskCropBuffer).blur(2).toBuffer();
+                
+                workingCanvas = workingCanvas.composite([{
+                    input: generatedPatchBuffer,
+                    blend: 'over',
+                    top: sourceCrop.top,
+                    left: sourceCrop.left,
+                    premultiplied: true,
+                }, {
+                    input: featheredMask,
+                    blend: 'dest-in', // Use mask as alpha channel for the composite operation
+                    top: sourceCrop.top,
+                    left: sourceCrop.left,
+                }]);
+            }
+            
+            // 4. === Final Output ===
+            const finalPngBuffer = await workingCanvas.png().toBuffer();
+            res.set("Content-Type", "image/png");
+            console.log(`OK: sending PNG ${sourceMeta.width}x${sourceMeta.height} after processing ${usedColors.length} color(s).`);
+            res.send(finalPngBuffer);
+
+        } catch (err) {
+            next(err); // Forward to global error handler
+        }
     });
-  return list;
-}
-
-app.get("/", (_req, res) => res.send("BadRobot worker is running. Use POST /process to submit a job."));
-
-app.post("/process", upload.any(), async (req, res, next) => {
-  try {
-    console.log("---- /process request ----");
-    
-    const files = req.files || [];
-    console.log("Metadata field:", req.files.find(f => f.fieldname === "metadata"));
-
-    // Validate that all uploaded field names are allowed
-    for (const f of files) {
-      if (!allowedField.test(f.fieldname)) {
-        // Map Multer’s vague error to a clear 400
-        return next(badRequest(`Unexpected field: ${f.fieldname}`));
-      }
-    }
-
-    // Ensure the two main images exist
-    const sourceFile = getOne(files, "source_image");
-    const refFile = getOne(files, "reference_image");
-    if (!sourceFile || !refFile) {
-      return next(badRequest("Missing file(s): require source_image and reference_image"));
-    }
-
-    // Validate MIME types
-    if (!okTypes.has(sourceFile.mimetype)) {
-      return next(unsupported(`Unsupported file type for source_image: ${sourceFile.mimetype}`));
-    }
-    if (!okTypes.has(refFile.mimetype)) {
-      return next(unsupported(`Unsupported file type for reference_image: ${refFile.mimetype}`));
-    }
-
-    // Collect masks
-    const sourceMasks = listMaskArray(files, "source_mask_");
-    const refMasks = listMaskArray(files, "reference_mask_");
-
-    if (sourceMasks.length === 0 || refMasks.length === 0) {
-      return next(badRequest("No masks found. Please paint at least one source_mask_# and reference_mask_#."));
-    }
-    if (sourceMasks.length !== refMasks.length) {
-      return next(badRequest(`Mask count mismatch. source=${sourceMasks.length} reference=${refMasks.length}`));
-    }
-    
-    console.log(`Processing ${sourceMasks.length} mask pair(s).`);
-
-    // Normalize to PNG buffers
-    const sourcePNG = await toPNG(sourceFile.buffer);
-    const refPNG = await toPNG(refFile.buffer);
-
-    const pairs = [];
-    for (let i = 0; i < sourceMasks.length; i++) {
-        const sMask = sourceMasks[i];
-        const rMask = refMasks[i];
-
-        if (!okTypes.has(sMask.mimetype)) {
-            return next(unsupported(`source_mask_${i} type: ${sMask.mimetype}`));
-        }
-        if (!okTypes.has(rMask.mimetype)) {
-            return next(unsupported(`reference_mask_${i} type: ${rMask.mimetype}`));
-        }
-
-        const sMaskPNG = await toPNG(sMask.buffer);
-        const rMaskPNG = await toPNG(rMask.buffer);
-
-        pairs.push({ index: i, sourceMaskPNG: sMaskPNG, referenceMaskPNG: rMaskPNG });
-    }
-
-    // Initialize working canvas from the source image
-    const workingCanvas = await Jimp.read(sourcePNG);
-    const W = workingCanvas.bitmap.width;
-    const H = workingCanvas.bitmap.height;
-    
-    // Load and resize reference image once
-    const refImg = await Jimp.read(refPNG);
-    refImg.resize(W, H, Jimp.RESIZE_BILINEAR);
-    
-    // Sequentially process each mask pair
-    for (const pair of pairs) {
-        console.log(`Processing mask pair ${pair.index}`);
-
-        // Load masks from buffers
-        let maskA = await Jimp.read(pair.sourceMaskPNG);
-        let maskB = await Jimp.read(pair.referenceMaskPNG);
-        
-        // Resize masks to working canvas size
-        maskA.resize(W, H, Jimp.RESIZE_BILINEAR);
-        maskB.resize(W, H, Jimp.RESIZE_BILINEAR);
-
-        // Compute bboxes
-        const bbA = await maskBBox(maskA);
-        const bbB = await maskBBox(maskB);
-        
-        if (!bbA || !bbB) {
-            console.warn(`Skipping pair ${pair.index} due to empty mask.`);
-            continue; // Skip this pair if a mask is empty
-        }
-
-        // 1) Crop reference to its bbox (Mask B)
-        const refCrop = refImg.clone().crop(bbB.x, bbB.y, bbB.w, bbB.h);
-    
-        // 2) Resize that crop to the source bbox (Mask A)
-        refCrop.resize(bbA.w, bbA.h, Jimp.RESIZE_BICUBIC);
-    
-        // 3) Build a patch canvas at base size, place resized crop into A's bbox
-        const refPatch = new Jimp(W, H, 0x00000000);
-        refPatch.composite(refCrop, bbA.x, bbA.y);
-    
-        // 4) Feather Mask A, then apply as alpha to the patch
-        const featheredA = await featherMask(maskA, 4);
-        refPatch.mask(featheredA, 0, 0);
-    
-        // 5) Composite patch over the *working canvas*
-        workingCanvas.composite(refPatch, 0, 0);
-    }
-
-    const png = await workingCanvas.getBufferAsync(Jimp.MIME_PNG);
-    res.set("Content-Type", "image/png");
-    console.log(`OK: sending PNG ${W}x${H} after processing ${pairs.length} mask pair(s).`);
-    res.send(png);
-
-  } catch (err) {
-    // Forward error to global handler
-    next(err);
-  }
 });
+
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
-
-// Multer error mapping
-app.use((err, _req, res, next) => {
-  // If this is Multer’s unexpected field error, turn it into 400
-  if (err && err.code === "LIMIT_UNEXPECTED_FILE") {
-    err.status = 400;
-    err.message = `Unexpected field: ${err.field}`;
-  }
-  next(err);
-});
 
 // Global error handler
 app.use((err, _req, res, _next) => {
     console.error("Worker error:", err);
     const status = err.status || 500;
-    const message = err.message || "Processing failed";
-    res.status(status).json({ error: message, details: String(err) });
+    res.status(status).json({ 
+        error: err.message || "Processing failed",
+        detail: err.detail || String(err) 
+    });
 });
 
 const PORT = process.env.PORT || 8080;

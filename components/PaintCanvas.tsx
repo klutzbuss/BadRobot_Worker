@@ -28,6 +28,7 @@ interface PaintCanvasProps {
   onPaintStart: () => void;
   onHistoryUpdate: () => void;
   onActiveColorsChange: (colors: Set<string>) => void;
+  onError: (message: string) => void;
 }
 
 export interface CanvasRef {
@@ -46,7 +47,7 @@ export interface CanvasRef {
   getCombinedMaskPNG: (colors: string[]) => Promise<Blob | null>;
 }
 
-const PaintCanvas = forwardRef<CanvasRef, PaintCanvasProps>(({ imageUrl, color, brushSize, onPaintStart, onHistoryUpdate, onActiveColorsChange }, ref) => {
+const PaintCanvas = forwardRef<CanvasRef, PaintCanvasProps>(({ imageUrl, color, brushSize, onPaintStart, onHistoryUpdate, onActiveColorsChange, onError }, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
   const [isPainting, setIsPainting] = useState(false);
@@ -303,21 +304,89 @@ const PaintCanvas = forwardRef<CanvasRef, PaintCanvasProps>(({ imageUrl, color, 
     redrawCanvas();
   };
 
+  const countBlobsOnCanvas = useCallback((pathsToTest: PathHistoryItem[]): number => {
+    const img = imageRef.current;
+    if (pathsToTest.length === 0 || !img) return pathsToTest.length;
+  
+    const { naturalWidth, naturalHeight } = img;
+    const tempCanvas = document.createElement('canvas');
+    // Use a smaller canvas for performance, e.g., max 400px
+    const scale = Math.min(1, 400 / Math.max(naturalWidth, naturalHeight));
+    const w = naturalWidth * scale;
+    const h = naturalHeight * scale;
+    tempCanvas.width = w;
+    tempCanvas.height = h;
+    
+    const ctx = tempCanvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return 1; // Failsafe
+  
+    ctx.scale(scale, scale);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'white';
+    
+    pathsToTest.forEach(({path, brushSize}) => {
+      ctx.lineWidth = brushSize;
+      ctx.stroke(path);
+    });
+  
+    const imageData = ctx.getImageData(0, 0, w, h);
+    const data = imageData.data;
+    const visited = new Uint8Array(w * h);
+    let blobCount = 0;
+  
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const index = y * w + x;
+        if (visited[index] === 0 && data[index * 4 + 3] > 0) {
+          blobCount++;
+          const queue: [number, number][] = [[x, y]];
+          visited[index] = 1;
+          while (queue.length > 0) {
+            const [cx, cy] = queue.shift()!;
+            const neighbors: [number, number][] = [[cx, cy - 1], [cx, cy + 1], [cx - 1, cy], [cx + 1, cy]];
+            for (const [nx, ny] of neighbors) {
+              if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                const nIndex = ny * w + nx;
+                if (visited[nIndex] === 0 && data[nIndex * 4 + 3] > 0) {
+                  visited[nIndex] = 1;
+                  queue.push([nx, ny]);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return blobCount;
+  }, []);
+
   const stopPainting = (e: React.MouseEvent | React.TouchEvent) => {
     e.preventDefault();
     if (!isPainting || !currentPathRef.current) return;
     
-    setIsPainting(false);
-    
     if (hasPaintedOnPath.current) {
-        const newHistory = historyRef.current.slice(0, historyIndexRef.current + 1);
-        newHistory.push({ color, path: currentPathRef.current, brushSize });
-        historyRef.current = newHistory;
-        historyIndexRef.current = newHistory.length - 1;
-        onHistoryUpdate();
-        updateActiveColors();
+        const pathsForCurrentColor = historyRef.current
+            .slice(0, historyIndexRef.current + 1)
+            .filter(item => item.color === color);
+        
+        const newPathItem = { color, path: currentPathRef.current, brushSize };
+        
+        const blobCount = countBlobsOnCanvas([...pathsForCurrentColor, newPathItem]);
+
+        if (blobCount > 1) {
+            onError("Each color can only mark one region on each canvas.");
+        } else {
+            const newHistory = historyRef.current.slice(0, historyIndexRef.current + 1);
+            newHistory.push(newPathItem);
+            historyRef.current = newHistory;
+            historyIndexRef.current = newHistory.length - 1;
+            onHistoryUpdate();
+            updateActiveColors();
+        }
     }
 
+    setIsPainting(false);
     currentPathRef.current = null;
     redrawCanvas();
   };
@@ -511,7 +580,7 @@ const PaintCanvas = forwardRef<CanvasRef, PaintCanvasProps>(({ imageUrl, color, 
         for (let y = 0; y < offscreenCanvas.height; y++) {
           for (let x = 0; x < offscreenCanvas.width; x++) {
             const i = (y * offscreenCanvas.width + x) * 4;
-            if (data[i] > 0) { // Check Red channel for white pixel
+            if (data[i + 3] > 0) { // Check Alpha channel
               if (x < minX) minX = x;
               if (x > maxX) maxX = x;
               if (y < minY) minY = y;
@@ -543,7 +612,7 @@ const PaintCanvas = forwardRef<CanvasRef, PaintCanvasProps>(({ imageUrl, color, 
         return await res.blob();
       },
     };
-  }, [redrawCanvas, onHistoryUpdate, fitAndCenterImage, updateActiveColors, brushSize, color]);
+  }, [redrawCanvas, onHistoryUpdate, fitAndCenterImage, updateActiveColors, brushSize, color, countBlobsOnCanvas, onError]);
 
   return (
     <div ref={containerRef} className="relative w-full h-full bg-gray-900 overflow-hidden flex items-center justify-center touch-none">

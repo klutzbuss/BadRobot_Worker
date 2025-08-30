@@ -11,7 +11,6 @@ import { validateImageFile } from '../lib/fileValidation';
 import { submitCorrection } from '../lib/form';
 import { WORKER_URL } from '../config/runtime';
 import { classifyPatch } from '../utils/classifyPatch';
-import type { WorkerMetadata, CorrectionPair } from '../types';
 
 type CorrectionMode = 'auto' | 'extract' | 'generate';
 
@@ -31,15 +30,12 @@ const loadImage = (src: string): Promise<HTMLImageElement> => {
     });
 };
 
-const INITIAL_COLORS = [
-  { name: 'Red', hex: '#ef4444' },
-  { name: 'Blue', hex: '#3b82f6' },
-  { name: 'Green', hex: '#22c55e' },
-  { name: 'Yellow', hex: '#eab308' },
-];
-
-const MORE_COLORS = [
-    '#9333ea', '#db2777', '#f97316', '#14b8a6', '#f43f5e', '#84cc16', '#6366f1', '#d946ef'
+const CORRECTION_COLORS = [
+  { name: 'red', hex: '#ef4444' },
+  { name: 'green', hex: '#22c55e' },
+  { name: 'blue', hex: '#3b82f6' },
+  { name: 'yellow', hex: '#eab308' },
+  { name: 'cyan', hex: '#22d3ee' },
 ];
 
 interface CorrectionPanelProps {
@@ -61,8 +57,8 @@ export interface CorrectionPanelRef {
 const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ sourceImage, sourceImageUrl, onCorrectionReady, onError, onHistoryUpdate, onReferenceImageUpload, onReplaceSourceImage }, ref) => {
   const [referenceImage, setReferenceImage] = useState<File | null>(null);
   const [referenceImageUrl, setReferenceImageUrl] = useState<string | null>(null);
-  const [colors, setColors] = useState(INITIAL_COLORS);
-  const [activeColor, setActiveColor] = useState(INITIAL_COLORS[0].hex);
+  const [colors] = useState(CORRECTION_COLORS);
+  const [activeColor, setActiveColor] = useState(CORRECTION_COLORS[0].hex);
   
   const [correctionModes, setCorrectionModes] = useState<Map<string, CorrectionMode>>(new Map());
   const [sourceActiveColors, setSourceActiveColors] = useState<Set<string>>(new Set());
@@ -70,12 +66,10 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
 
   const [isLoading, setIsLoading] = useState(false);
   const [brushSize, setBrushSize] = useState(30);
-  const [isColorPickerOpen, setIsColorPickerOpen] = useState(false);
   const [lastPaintedCanvas, setLastPaintedCanvas] = useState<'source' | 'ref' | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [outputSizeStatus, setOutputSizeStatus] = useState<{w: number, h: number, ok: boolean} | null>(null);
 
-  const colorPickerRef = useRef<HTMLDivElement>(null);
   const brushSliderRef = useRef<HTMLInputElement>(null);
   const sourceCanvasRef = useRef<CanvasRef>(null);
   const refCanvasRef = useRef<CanvasRef>(null);
@@ -137,18 +131,6 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
     }
   }));
 
-  // Close color picker on outside click
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (isColorPickerOpen && colorPickerRef.current && !colorPickerRef.current.contains(event.target as Node)) {
-        setIsColorPickerOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [isColorPickerOpen]);
-
-
   useEffect(() => {
     if (referenceImage) {
       const url = URL.createObjectURL(referenceImage);
@@ -191,41 +173,19 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
     setCorrectionModes(prev => new Map(prev).set(color, mode));
   };
   
-  const addColor = (newColorHex: string) => {
-    const colorName = `Color #${colors.length + 1}`;
-    const newColor = { name: colorName, hex: newColorHex };
-    setColors([...colors, newColor]);
-    setActiveColor(newColorHex);
-    setIsColorPickerOpen(false);
-  };
-  
-  const deleteColor = (colorToDelete: string) => {
-    setColors(colors.filter(c => c.hex !== colorToDelete));
-    sourceCanvasRef.current?.deletePathsForColor(colorToDelete);
-    refCanvasRef.current?.deletePathsForColor(colorToDelete);
-    setCorrectionModes(prev => {
-        const newModes = new Map(prev);
-        newModes.delete(colorToDelete);
-        return newModes;
-    });
-
-    if (activeColor === colorToDelete && colors.length > 1) {
-        setActiveColor(colors.find(c => c.hex !== colorToDelete)!.hex);
-    } else if (colors.length <=1) {
-        setActiveColor('');
-    }
-  }
-
   const pairedColors = useMemo(() => {
     return [...sourceActiveColors].filter(c => refActiveColors.has(c));
   }, [sourceActiveColors, refActiveColors]);
 
   const activeCorrectionTasks = useMemo(() => {
-    return pairedColors.map(color => ({
-        color,
-        name: colors.find(c => c.hex === color)?.name || color,
-        mode: correctionModes.get(color) || 'auto',
-    }));
+    return pairedColors.map(colorHex => {
+      const colorInfo = colors.find(c => c.hex === colorHex);
+      return {
+        hex: colorHex,
+        name: colorInfo?.name || colorHex,
+        mode: correctionModes.get(colorHex) || 'auto',
+      }
+    });
   }, [pairedColors, colors, correctionModes]);
 
   const handleGenerate = async () => {
@@ -251,75 +211,42 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
         
         console.log(`[BadRobot] Preparing ${validPairedColors.length} correction pair(s).`);
 
-        // 1. Build metadata and prepare mask blobs simultaneously
-        const sourceMasks: Blob[] = [];
-        const referenceMasks: Blob[] = [];
-        const pairs: CorrectionPair[] = [];
+        const maskPairs = [];
 
-        for (const color of validPairedColors) {
-            const sourceMask = await sourceCanvasRef.current.getMaskPNG(color);
-            const refMask = await refCanvasRef.current.getMaskPNG(color);
+        for (const colorHex of validPairedColors) {
+            const sourceMask = await sourceCanvasRef.current.getMaskPNG(colorHex);
+            const refMask = await refCanvasRef.current.getMaskPNG(colorHex);
 
             if (!sourceMask || !refMask) {
-                console.warn(`Skipping incomplete mask pair for color ${color}`);
+                console.warn(`Skipping incomplete mask pair for color ${colorHex}`);
+                continue;
+            }
+            
+            const colorName = colors.find(c => c.hex === colorHex)?.name;
+            if (!colorName) {
+                console.warn(`Skipping mask for unknown color hex ${colorHex}`);
                 continue;
             }
 
-            // Get method, auto-classifying if needed
-            const userSelectedMode = correctionModes.get(color) || 'auto';
-            let finalMethod: 'extract' | 'generate' = 'generate'; // Default
-
-            if (userSelectedMode === 'extract' || userSelectedMode === 'generate') {
-                finalMethod = userSelectedMode;
-            } else { // 'auto'
-                console.log(`[BadRobot] Auto-classifying patch for color ${color}`);
-                const patchB64 = await sourceCanvasRef.current.extractPatchForColor(color);
-                if (patchB64) {
-                    const classification = await classifyPatch(patchB64);
-                    finalMethod = classification.route === 'copy_exact' ? 'extract' : 'generate';
-                    console.log(`[BadRobot] Auto-classified as: ${finalMethod} (Confidence: ${classification.confidence})`);
-                } else {
-                    console.warn(`Could not extract patch for color ${color}, defaulting to 'generate'`);
-                }
-            }
-
-            // Get bounding boxes
-            const sourceBBox = sourceCanvasRef.current.getMaskBBox(color);
-            const referenceBBox = refCanvasRef.current.getMaskBBox(color);
-
-            pairs.push({
-                colorId: color,
-                method: finalMethod,
-                sourceBBox,
-                referenceBBox,
+            maskPairs.push({
+                colorName: colorName,
+                sourceMask: sourceMask,
+                referenceMask: refMask,
             });
-
-            sourceMasks.push(sourceMask);
-            referenceMasks.push(refMask);
         }
         
-        if (pairs.length === 0) {
+        if (maskPairs.length === 0) {
             throw new Error("No valid, complete mask pairs were generated. Ensure you paint on both images with the same color.");
         }
 
-        const metadata: WorkerMetadata = {
-            width: W,
-            height: H,
-            enforceFixedCanvas: true,
-            sequential: true,
-            pairs: pairs,
-        };
-
-        console.log(`[BadRobot] Submitting correction with metadata:`, metadata);
+        console.log(`[BadRobot] Submitting correction with ${maskPairs.length} pairs.`);
 
         // 2. Call the worker via the new helper
         const resultBlob = await submitCorrection({
             workerUrl: WORKER_URL,
             distortedFile: sourceImage,
             referenceFile: referenceImage,
-            sourceMasks: sourceMasks,
-            referenceMasks: referenceMasks,
-            metadata: metadata,
+            maskPairs: maskPairs,
         });
 
         // 3. Process the returned image
@@ -378,7 +305,7 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
                 <div className="flex flex-col items-center gap-2">
                     <h3 className="text-lg font-semibold">Distorted Image (Source)</h3>
                     <div className="w-full aspect-square bg-black/20 rounded-lg overflow-hidden border border-gray-700 relative group">
-                        <PaintCanvas ref={sourceCanvasRef} imageUrl={sourceImageUrl} color={activeColor} brushSize={brushSize} onPaintStart={() => setLastPaintedCanvas('source')} onHistoryUpdate={updateParentHistory} onActiveColorsChange={setSourceActiveColors} />
+                        <PaintCanvas ref={sourceCanvasRef} imageUrl={sourceImageUrl} color={activeColor} brushSize={brushSize} onPaintStart={() => setLastPaintedCanvas('source')} onHistoryUpdate={updateParentHistory} onActiveColorsChange={setSourceActiveColors} onError={onError} />
                         <label htmlFor="source-replace-upload" title="Upload new image" className="absolute top-2 right-2 p-2 bg-black/50 rounded-full cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity backdrop-blur-sm hover:bg-black/75">
                             <UploadIcon className="w-5 h-5 text-white" />
                         </label>
@@ -388,7 +315,7 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
                 <div className="flex flex-col items-center gap-2">
                     <h3 className="text-lg font-semibold">Clean Design (Reference)</h3>
                     <div className="w-full aspect-square bg-black/20 rounded-lg overflow-hidden border border-gray-700 relative group">
-                        <PaintCanvas ref={refCanvasRef} imageUrl={referenceImageUrl} color={activeColor} brushSize={brushSize} onPaintStart={() => setLastPaintedCanvas('ref')} onHistoryUpdate={updateParentHistory} onActiveColorsChange={setRefActiveColors} />
+                        <PaintCanvas ref={refCanvasRef} imageUrl={referenceImageUrl} color={activeColor} brushSize={brushSize} onPaintStart={() => setLastPaintedCanvas('ref')} onHistoryUpdate={updateParentHistory} onActiveColorsChange={setRefActiveColors} onError={onError} />
                         <label htmlFor="ref-replace-upload" title="Upload new image" className="absolute top-2 right-2 p-2 bg-black/50 rounded-full cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity backdrop-blur-sm hover:bg-black/75">
                             <UploadIcon className="w-5 h-5 text-white" />
                         </label>
@@ -406,23 +333,8 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
                     {colors.map(c => (
                         <div key={c.hex} className="relative group">
                             <button onClick={() => setActiveColor(c.hex)} className={`w-8 h-8 rounded-full border-2 transition-transform ${activeColor === c.hex ? 'border-white scale-110 shadow-lg' : 'border-transparent'}`} style={{backgroundColor: c.hex}} aria-label={`Select ${c.name} color`}></button>
-                            {colors.length > 1 && (
-                                <button onClick={() => deleteColor(c.hex)} className="absolute -top-2 -right-2 w-5 h-5 bg-red-500 rounded-full text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity" aria-label={`Delete ${c.name} color`}>
-                                    <TrashIcon className="w-3 h-3" />
-                                </button>
-                            )}
                         </div>
                     ))}
-                    <button onClick={() => setIsColorPickerOpen(true)} className="w-8 h-8 rounded-full border-2 border-dashed border-gray-500 text-gray-400 flex items-center justify-center hover:bg-white/10 hover:border-gray-400 transition-all" aria-label="Add new color">
-                        <PlusIcon className="w-5 h-5" />
-                    </button>
-                    {isColorPickerOpen && (
-                        <div ref={colorPickerRef} className="absolute top-12 z-10 bg-gray-900 border border-gray-700 rounded-lg p-2 grid grid-cols-4 gap-2 shadow-2xl">
-                            {MORE_COLORS.filter(mc => !colors.some(c => c.hex === mc)).map(hex => (
-                                <button key={hex} onClick={() => addColor(hex)} className="w-8 h-8 rounded-full" style={{backgroundColor: hex}}></button>
-                            ))}
-                        </div>
-                    )}
                 </div>
                 
                 <div className="flex items-center gap-4 px-4">
@@ -442,10 +354,10 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
                     <div className="border-t border-gray-700 pt-4 flex flex-col gap-3">
                         <h4 className="text-center font-semibold">Linked Correction Tasks</h4>
                         {activeCorrectionTasks.map(task => (
-                            <div key={task.color} className="flex items-center justify-between bg-black/20 p-2 rounded-md">
+                            <div key={task.hex} className="flex items-center justify-between bg-black/20 p-2 rounded-md">
                                 <div className="flex items-center gap-2">
-                                    <div className="w-5 h-5 rounded-full" style={{backgroundColor: task.color}}></div>
-                                    <span className="font-semibold">{task.name}</span>
+                                    <div className="w-5 h-5 rounded-full" style={{backgroundColor: task.hex}}></div>
+                                    <span className="font-semibold capitalize">{task.name}</span>
                                     <CheckIcon className="w-5 h-5 text-green-400 animate-fade-in" title="This correction is linked and ready"/>
                                 </div>
                                 <div className="flex items-center gap-3">
@@ -453,13 +365,13 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
                                         <label className="text-sm font-medium text-gray-300">Method:</label>
                                         <QuestionMarkCircleIcon className="w-4 h-4 text-gray-400 cursor-help"/>
                                         <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-64 bg-gray-900 border border-gray-600 text-gray-300 text-xs rounded-lg p-3 z-10 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none shadow-lg">
-                                            <strong className="block">Auto:</strong> The AI chooses for you.
-                                            <strong className="block mt-2">Extract:</strong> Warps existing material. Best for text and logos.
-                                            <strong className="block mt-2">Generate:</strong> Regenerates from scratch. Best for shapes and textures.
+                                            <strong className="block">Auto:</strong> Let the AI decide the best method.
+                                            <strong className="block mt-2">Extract:</strong> Warps reference material. Best for text, logos, and sharp vector-like features.
+                                            <strong className="block mt-2">Generate:</strong> Regenerates content from scratch using the reference as a style guide. Best for textures, patterns, and photographic areas.
                                             <div className="absolute top-full left-1/2 -translate-x-1/2 w-0 h-0 border-x-4 border-x-transparent border-t-4 border-t-gray-600"></div>
                                         </div>
                                     </div>
-                                    <select value={task.mode} onChange={(e) => handleModeChange(task.color, e.target.value as CorrectionMode)} className="bg-gray-700 border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-1.5">
+                                    <select value={task.mode} onChange={(e) => handleModeChange(task.hex, e.target.value as CorrectionMode)} className="bg-gray-700 border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-1.5">
                                         <option value="auto">Auto</option>
                                         <option value="extract">Extract</option>
                                         <option value="generate">Generate</option>
@@ -476,7 +388,7 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
                       disabled={isLoading || pairedColors.length === 0}
                       className="w-full bg-gradient-to-br from-green-600 to-green-500 text-white font-bold py-4 px-6 rounded-lg transition-all duration-300 ease-in-out shadow-lg shadow-green-500/20 hover:shadow-xl hover:shadow-green-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner text-base disabled:from-gray-600 disabled:to-gray-700 disabled:shadow-none disabled:cursor-not-allowed disabled:transform-none"
                   >
-                      {isLoading ? 'Generating...' : (pairedColors.length === 0 ? 'Awaiting Correction Link...' : 'Generate Correction')}
+                      {isLoading ? 'Generating...' : (pairedColors.length === 0 ? 'Awaiting Correction Link...' : `Generate Correction (${pairedColors.length})`)}
                   </button>
                   {outputSizeStatus && (
                     <div className={`text-xs px-2 py-1 rounded-md ${outputSizeStatus.ok ? 'bg-green-500/20 text-green-300' : 'bg-red-500/20 text-red-300'}`}>
