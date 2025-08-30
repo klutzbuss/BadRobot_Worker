@@ -15,8 +15,8 @@ app.use(express.json());
 
 // --- Health and Status Routes ---
 // Fast, lightweight routes for Cloud Run health checks and basic status.
-app.get("/", (_req, res) => res.send("BadRobot AI worker is running. Use POST /process to submit a job."));
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get('/', (_req, res) => res.type('text/plain').send('BadRobot worker is running. Use POST /process.'));
+app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
 
 const COLORS = ['red', 'green', 'blue', 'yellow', 'cyan'];
@@ -233,6 +233,7 @@ app.use((err, _req, res, _next) => {
 
 // --- Server Startup ---
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Worker listening on port ${PORT}`);
+const HOST = '0.0.0.0';
+app.listen(PORT, HOST, () => {
+  console.log(`[worker] listening on http://${HOST}:${PORT}`);
 });
