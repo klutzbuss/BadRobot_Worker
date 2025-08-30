@@ -85,6 +85,15 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
   const refCanvasRef = useRef<CanvasRef>(null);
   const blinkIntervalRef = useRef<number | null>(null);
 
+  // Revoke object URL on change or unmount to prevent memory leaks
+  useEffect(() => {
+    return () => {
+      if (correctedImageUrl) {
+        URL.revokeObjectURL(correctedImageUrl);
+      }
+    };
+  }, [correctedImageUrl]);
+
   const updateParentHistory = useCallback(() => {
     const sourceHistory = sourceCanvasRef.current?.getHistoryState() ?? { canUndo: false, canRedo: false };
     const refHistory = refCanvasRef.current?.getHistoryState() ?? { canUndo: false, canRedo: false };
@@ -262,9 +271,16 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
         onError("Please upload a reference image.");
         return;
     }
+    
+    // Clear previous results before starting
+    if (correctedImageUrl) {
+        URL.revokeObjectURL(correctedImageUrl);
+    }
+    setCorrectedImageUrl(null);
+    setCompare(null);
+    setIsBlinking(false);
 
     setIsLoading(true);
-    setCorrectedImageUrl(null);
     onError("");
     setOutputSizeStatus(null);
     
@@ -388,54 +404,6 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
           console.log("[BadRobot] Downloaded corrected.png");
       }
   };
-  
-  if(correctedImageUrl) {
-    return (
-        <div className="w-full flex flex-col items-center gap-4 animate-fade-in">
-            <h2 className="text-2xl font-bold">Correction Complete</h2>
-            <div className="w-full max-w-4xl relative">
-                <button 
-                  onClick={() => {
-                    if (correctedImageUrl) {
-                        URL.revokeObjectURL(correctedImageUrl);
-                    }
-                    setCorrectedImageUrl(null);
-                    setCompare(null);
-                    setIsBlinking(false);
-                  }}
-                  className="absolute top-2 left-2 z-20 flex items-center gap-2 bg-black/50 backdrop-blur-sm text-white font-semibold py-2 px-4 rounded-full transition-all duration-200 ease-in-out hover:bg-black/75 active:scale-95 text-base"
-                  aria-label="Go back to painting"
-                >
-                  <ArrowLeftIcon className="w-5 h-5"/>
-                  Back
-                </button>
-                <div className="relative w-full h-full max-h-[70vh]">
-                    <ComparisonSlider beforeUrl={sourceImageUrl} afterUrl={correctedImageUrl} />
-                </div>
-            </div>
-            <div className="flex items-center gap-4">
-                <button 
-                    onClick={() => {
-                        if (!compare) return;
-                        console.log("[BadRobot] Blink compare", compare);
-                        setIsBlinking(prev => !prev);
-                    }}
-                    disabled={!compare}
-                    className={`font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out text-base ${isBlinking ? 'bg-blue-500 text-white' : 'bg-white/10 text-gray-200 hover:bg-white/20'} disabled:opacity-50 disabled:cursor-not-allowed`}
-                >
-                    Blink Compare
-                </button>
-                <button 
-                    onClick={handleDownload}
-                    disabled={!correctedImageUrl}
-                    className="bg-gradient-to-br from-green-600 to-green-500 text-white font-bold py-3 px-5 rounded-md transition-all duration-300 ease-in-out shadow-lg shadow-green-500/20 hover:shadow-xl hover:shadow-green-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner text-base disabled:from-gray-600 disabled:to-gray-700 disabled:shadow-none disabled:cursor-not-allowed disabled:transform-none"
-                >
-                    Download Image
-                </button>
-            </div>
-        </div>
-    )
-  }
 
   return (
     <div className="w-full flex flex-col items-center gap-4 animate-fade-in relative">
@@ -578,6 +546,37 @@ const CorrectionPanel = forwardRef<CorrectionPanelRef, CorrectionPanelProps>(({ 
                   )}
                 </div>
             </div>
+
+            {correctedImageUrl && (
+                <div className="w-full max-w-4xl flex flex-col items-center gap-4 animate-fade-in mt-6 border-t border-gray-700 pt-6">
+                    <h2 className="text-2xl font-bold">Correction Complete</h2>
+                    <div className="w-full relative">
+                        <div className="relative w-full h-full max-h-[70vh]">
+                            <ComparisonSlider beforeUrl={sourceImageUrl} afterUrl={correctedImageUrl} />
+                        </div>
+                    </div>
+                    <div className="flex items-center gap-4">
+                        <button 
+                            onClick={() => {
+                                if (!compare) return;
+                                console.log("[BadRobot] Blink compare", compare);
+                                setIsBlinking(prev => !prev);
+                            }}
+                            disabled={!compare}
+                            className={`font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out text-base ${isBlinking ? 'bg-blue-500 text-white' : 'bg-white/10 text-gray-200 hover:bg-white/20'} disabled:opacity-50 disabled:cursor-not-allowed`}
+                        >
+                            Blink Compare
+                        </button>
+                        <button 
+                            onClick={handleDownload}
+                            disabled={!correctedImageUrl}
+                            className="bg-gradient-to-br from-green-600 to-green-500 text-white font-bold py-3 px-5 rounded-md transition-all duration-300 ease-in-out shadow-lg shadow-green-500/20 hover:shadow-xl hover:shadow-green-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner text-base disabled:from-gray-600 disabled:to-gray-700 disabled:shadow-none disabled:cursor-not-allowed disabled:transform-none"
+                        >
+                            Download Image
+                        </button>
+                    </div>
+                </div>
+            )}
         </>
       )}
     </div>
