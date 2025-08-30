@@ -13,6 +13,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- Health and Status Routes ---
+// Fast, lightweight routes for Cloud Run health checks and basic status.
+app.get("/", (_req, res) => res.send("BadRobot AI worker is running. Use POST /process to submit a job."));
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+
 const COLORS = ['red', 'green', 'blue', 'yellow', 'cyan'];
 
 // --- Multer Setup ---
@@ -90,9 +96,7 @@ function badRequest(detail, error = "Bad Request") {
   return err;
 }
 
-// --- Express Routes ---
-
-app.get("/", (_req, res) => res.send("BadRobot AI worker is running. Use POST /process to submit a job."));
+// --- Main Processing Route ---
 
 app.post("/process", (req, res, next) => {
     upload(req, res, async (err) => {
@@ -217,8 +221,6 @@ app.post("/process", (req, res, next) => {
 });
 
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
 // Global error handler
 app.use((err, _req, res, _next) => {
     console.error("Worker error:", err);
@@ -229,5 +231,8 @@ app.use((err, _req, res, _next) => {
     });
 });
 
+// --- Server Startup ---
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Worker listening on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Worker listening on port ${PORT}`);
+});
