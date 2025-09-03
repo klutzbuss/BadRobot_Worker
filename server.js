@@ -7,226 +7,159 @@ import express from "express";
 import multer from "multer";
 import cors from "cors";
 import sharp from "sharp";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, Modality } from "@google/generative-ai";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // --- Health and Status Routes ---
-// Fast, lightweight routes for Cloud Run health checks and basic status.
 app.get('/', (_req, res) => res.type('text/plain').send('BadRobot worker is running. Use POST /process to submit a job.'));
 app.get('/health', (_req, res) => res.json({ ok: true, time: Date.now() }));
 
-
-// --- Image Processing & Validation Helpers ---
-
-/**
- * Counts the number of separate connected components (blobs) in a mask image.
- * @param {Buffer} buffer The image buffer for the mask.
- * @returns {Promise<number>} The number of blobs found.
- */
-async function countBlobs(buffer) {
-    try {
-        const image = sharp(buffer);
-        const { data, info } = await image.raw().toBuffer({ resolveWithObject: true });
-        const { width, height, channels } = info;
-        const visited = new Uint8Array(width * height);
-        let blobCount = 0;
-
-        for (let y = 0; y < height; y++) {
-            for (let x = 0; x < width; x++) {
-                const index = y * width + x;
-                const pixelIsMarked = data[index * channels] > 128; // Check R channel for white
-
-                if (pixelIsMarked && visited[index] === 0) {
-                    blobCount++;
-                    const queue = [[x, y]];
-                    visited[index] = 1;
-                    while (queue.length > 0) {
-                        const [cx, cy] = queue.shift();
-                        const neighbors = [[cx, cy - 1], [cx, cy + 1], [cx - 1, cy], [cx + 1, cy]];
-                        for (const [nx, ny] of neighbors) {
-                            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                                const nIndex = ny * width + nx;
-                                if (visited[nIndex] === 0 && data[nIndex * channels] > 128) {
-                                    visited[nIndex] = 1;
-                                    queue.push([nx, ny]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return blobCount;
-    } catch (error) {
-        console.error("Error in countBlobs:", error);
-        return -1; // Indicate an error
-    }
-}
-
-// Error helpers
+// --- Error Helper ---
 function badRequest(detail, error = "Bad Request") {
-  const err = new Error(error);
-  err.status = 400;
-  err.detail = detail;
-  return err;
+    const err = new Error(error);
+    err.status = 400;
+    err.detail = detail;
+    return err;
 }
 
 // --- Multer Setup ---
-const upload = multer({ 
-    storage: multer.memoryStorage(), 
-    limits: { fileSize: 25 * 1024 * 1024 } 
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 25 * 1024 * 1024 } // 25MB limit
 });
 
-
 // --- Gemini AI Setup ---
-const genAI = new GoogleGenerativeAI({ apiKey: process.env.API_KEY });
-const geminiModel = 'gemini-2.5-flash-image-preview';
-const model = genAI.getGenerativeModel({ model: geminiModel });
+if (!process.env.API_KEY) {
+    // Fallback to the key name from the prompt for compatibility, but prefer the standard name.
+    if (!process.env.GENAI_API_KEY) {
+        throw new Error("API_KEY or GENAI_API_KEY environment variable is not set.");
+    }
+    process.env.API_KEY = process.env.GENAI_API_KEY;
+}
 
+const ai = new GoogleGenerativeAI({ apiKey: process.env.API_KEY });
+const MODEL_ID = 'gemini-2.5-flash-image-preview'; // aka "nano-banana"
+
+/**
+ * Helper to normalize an image buffer to PNG format.
+ * @param {Buffer} buffer The input image buffer (e.g., JPEG, WEBP).
+ * @returns {Promise<Buffer>} The image buffer in PNG format.
+ */
+async function toPng(buffer) {
+    return sharp(buffer).png().toBuffer();
+}
 
 // --- Main Processing Route ---
-
 app.post("/process", upload.any(), async (req, res, next) => {
     try {
         console.log("---- /process request ----");
         const files = req.files || [];
+        console.log("Fieldnames received:", files.map(f => f.fieldname));
 
-        // 1. === Basic Validation ===
+        // 1. === File Validation ===
         const sourceImageFile = files.find(f => f.fieldname === 'source_image');
         const referenceImageFile = files.find(f => f.fieldname === 'reference_image');
         
         if (!sourceImageFile) throw badRequest("Missing required file: source_image");
         if (!referenceImageFile) throw badRequest("Missing required file: reference_image");
-
-        const maskMap = new Map();
-        for (const f of files) {
-            const m = /^(\w+)_mask_(\w+)$/.exec(f.fieldname);
-            if (!m) continue;
-            const [, which, color] = m;
-            if (!maskMap.has(color)) maskMap.set(color, {});
-            maskMap.get(color)[which] = f;
-        }
-
-        const maskPairs = [];
-        for (const [color, pair] of maskMap) {
-            if (pair.source && pair.reference) {
-                maskPairs.push({ color, source: pair.source, reference: pair.reference });
-            }
-        }
-
-        if (maskPairs.length === 0) {
-            throw badRequest("No complete mask pairs (source+reference) found.");
-        }
-
-        // 2. === Per-Color Mask Validation ===
-        for (const { color, source: sourceMaskFile, reference: refMaskFile } of maskPairs) {
-            const sourceBlobCount = await countBlobs(sourceMaskFile.buffer);
-            if (sourceBlobCount !== 1) {
-                throw badRequest(`Invalid mask: Color '${color}' must contain exactly one region on the source canvas, but found ${sourceBlobCount}.`);
-            }
-
-            const refBlobCount = await countBlobs(refMaskFile.buffer);
-            if (refBlobCount !== 1) {
-                throw badRequest(`Invalid mask: Color '${color}' must contain exactly one region on the reference canvas, but found ${refBlobCount}.`);
-            }
-        }
-
-        // 3. === AI Processing Pipeline ===
-        let workingCanvas = sharp(sourceImageFile.buffer);
-        const sourceMeta = await workingCanvas.metadata();
-
-        for (const { color, source: sourceMaskFile, reference: refMaskFile } of maskPairs) {
-            console.log(`Processing color: ${color}`);
-            const sourceMask = sharp(sourceMaskFile.buffer);
-            const referenceMask = sharp(refMaskFile.buffer);
-
-            // Get bounding boxes
-            const sourceStats = await sourceMask.stats();
-            const refStats = await referenceMask.stats();
-            
-            // dominant will be white, so we can get its coordinates
-            const sourceCrop = { left: sourceStats.channels[0].minX, top: sourceStats.channels[0].minY, width: sourceStats.channels[0].maxX - sourceStats.channels[0].minX + 1, height: sourceStats.channels[0].maxY - sourceStats.channels[0].minY + 1 };
-            const refCrop = { left: refStats.channels[0].minX, top: refStats.channels[0].minY, width: refStats.channels[0].maxX - refStats.channels[0].minX + 1, height: refStats.channels[0].maxY - refStats.channels[0].minY + 1 };
-            
-            // Pad bboxes slightly
-            const padding = 8;
-            sourceCrop.left = Math.max(0, sourceCrop.left - padding);
-            sourceCrop.top = Math.max(0, sourceCrop.top - padding);
-            sourceCrop.width = Math.min(sourceMeta.width - sourceCrop.left, sourceCrop.width + padding * 2);
-            sourceCrop.height = Math.min(sourceMeta.height - sourceCrop.top, sourceCrop.height + padding * 2);
-
-            // Crop patches
-            const sourcePatchBuffer = await workingCanvas.clone().extract(sourceCrop).png().toBuffer();
-            const refPatchBuffer = await sharp(referenceImageFile.buffer).extract(refCrop).png().toBuffer();
-            const sourceMaskCropBuffer = await sourceMask.extract(sourceCrop).png().toBuffer();
-
-            // Call Gemini
-            const prompt = "Recreate the content from the reference patch and realistically adapt it into the source patch region. Preserve shirt/fabric geometry, wrinkles, perspective, and local lighting/shadows. Confine changes to the masked region only; do not alter the surrounding pixels.";
-            
-            const parts = [
-                { text: prompt },
-                { inlineData: { mimeType: 'image/png', data: sourcePatchBuffer.toString('base64') } },
-                { inlineData: { mimeType: 'image/png', data: sourceMaskCropBuffer.toString('base64') } },
-                { inlineData: { mimeType: 'image/png', data: refPatchBuffer.toString('base64') } },
-            ];
-            
-            const result = await model.generateContent({
-                contents: [{ parts: parts }]
-            });
-            const response = result.response;
-
-            const imagePart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
-            if (!imagePart?.inlineData) {
-                const feedback = response.promptFeedback || response.candidates?.[0]?.finishReason;
-                throw new Error(`AI did not return an image for color '${color}'. Reason: ${JSON.stringify(feedback)}`);
-            }
-
-            const generatedPatchBuffer = Buffer.from(imagePart.inlineData.data, 'base64');
-
-            // Feather mask and composite back
-            const featheredMask = await sharp(sourceMaskCropBuffer).blur(2).toBuffer();
-            
-            workingCanvas = workingCanvas.composite([{
-                input: generatedPatchBuffer,
-                blend: 'over',
-                top: sourceCrop.top,
-                left: sourceCrop.left,
-                premultiplied: true,
-            }, {
-                input: featheredMask,
-                blend: 'dest-in', // Use mask as alpha channel for the composite operation
-                top: sourceCrop.top,
-                left: sourceCrop.left,
-            }]);
-        }
         
-        // 4. === Final Output ===
-        const finalPngBuffer = await workingCanvas.png().toBuffer();
-        res.set("Content-Type", "image/png");
-        console.log(`OK: sending PNG ${sourceMeta.width}x${sourceMeta.height} after processing ${maskPairs.length} color(s).`);
-        res.send(finalPngBuffer);
+        const sourceMaskFile = files.find(f => f.fieldname === 'source_mask_0');
+        const referenceMaskFile = files.find(f => f.fieldname === 'reference_mask_0');
+
+        if (!sourceMaskFile) throw badRequest("Missing required file: source_mask_0");
+        if (!referenceMaskFile) throw badRequest("Missing required file: reference_mask_0");
+            
+        // 2. === Image Preparation ===
+        console.log("Normalizing images to PNG...");
+        const [sourcePng, referencePng, sourceMaskPng, referenceMaskPng] = await Promise.all([
+            toPng(sourceImageFile.buffer),
+            toPng(referenceImageFile.buffer),
+            toPng(sourceMaskFile.buffer),
+            toPng(referenceMaskFile.buffer),
+        ]);
+
+        const sourceMeta = await sharp(sourcePng).metadata();
+        const { width, height } = sourceMeta;
+        if (!width || !height) {
+            throw badRequest("Could not determine source image dimensions.");
+        }
+        console.log(`Source dimensions: ${width}x${height}`);
+
+        // 3. === AI Processing ===
+        const prompt = `You are an expert AI image editor. Your task is to correct a distorted region in a source image using a provided clean reference design.
+
+        You are provided with four images in this order:
+        1.  **Source Image:** The original image with a distorted area.
+        2.  **Reference Image:** An image containing the clean, correct version of the design.
+        3.  **Source Mask:** A mask indicating the distorted region on the "Source Image" that needs to be replaced.
+        4.  **Reference Mask:** A mask indicating the clean design on the "Reference Image" to be used for the correction.
+
+        Your goal is to take the content from the "Reference Image" (as indicated by the "Reference Mask") and apply it to the "Source Image" (in the area indicated by the "Source Mask").
+
+        Key requirements:
+        - The correction must be seamless. Match the lighting, shadows, texture, and perspective of the original "Source Image".
+        - The final output image MUST have the exact same dimensions as the original "Source Image" (${width}x${height} pixels).
+        - Do not change anything outside the masked area.
+        - Return ONLY the final, full-size, edited image. Do not return any text.`;
+
+        const parts = [
+            { text: prompt },
+            { inlineData: { mimeType: 'image/png', data: sourcePng.toString('base64') } },
+            { inlineData: { mimeType: 'image/png', data: referencePng.toString('base64') } },
+            { inlineData: { mimeType: 'image/png', data: sourceMaskPng.toString('base64') } },
+            { inlineData: { mimeType: 'image/png', data: referenceMaskPng.toString('base64') } },
+        ];
+
+        console.log(`Calling model ${MODEL_ID}...`);
+        const response = await ai.models.generateContent({
+            model: MODEL_ID,
+            contents: { parts },
+            config: {
+                responseModalities: [Modality.IMAGE, Modality.TEXT],
+            },
+        });
+        console.log("Model response received.");
+
+        // 4. === Response Handling ===
+        if (response.promptFeedback?.blockReason) {
+            const { blockReason, blockReasonMessage } = response.promptFeedback;
+            throw new Error(`Request was blocked by API. Reason: ${blockReason}. ${blockReasonMessage || ''}`);
+        }
+
+        const imagePart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
+        if (!imagePart?.inlineData?.data) {
+            const finishReason = response.candidates?.[0]?.finishReason;
+            const textFeedback = response.text?.trim();
+            console.error("AI response did not contain an image.", { finishReason, textFeedback, response });
+            throw new Error(`Processing failed: AI did not return an image. Reason: ${finishReason || 'Unknown'}. ${textFeedback ? `Details: ${textFeedback}` : ''}`);
+        }
+
+        const finalImageBuffer = Buffer.from(imagePart.inlineData.data, 'base64');
+        
+        res.setHeader('Content-Type', 'image/png');
+        console.log(`OK: sending PNG ${width}x${height}.`);
+        res.send(finalImageBuffer);
 
     } catch (err) {
         next(err); // Forward to global error handler
     }
 });
 
-
 // Global error handler
 app.use((err, _req, res, _next) => {
     console.error("Worker error:", err);
     const status = err.status || 500;
-    res.status(status).json({ 
+    res.status(status).json({
         error: err.message || "Processing failed",
-        detail: err.detail || String(err) 
+        detail: err.detail || String(err)
     });
 });
 
 // --- Server Startup ---
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[worker] listening on ${PORT}`);
+    console.log(`[worker] listening on ${PORT}`);
 });
