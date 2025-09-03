@@ -7,7 +7,7 @@ import express from "express";
 import multer from "multer";
 import cors from "cors";
 import sharp from "sharp";
-import { GoogleGenerativeAI, Modality } from "@google/generative-ai";
+import { GoogleGenAI, Modality } from "@google/genai";
 
 const app = express();
 app.use(cors());
@@ -33,14 +33,10 @@ const upload = multer({
 
 // --- Gemini AI Setup ---
 if (!process.env.API_KEY) {
-    // Fallback to the key name from the prompt for compatibility, but prefer the standard name.
-    if (!process.env.GENAI_API_KEY) {
-        throw new Error("API_KEY or GENAI_API_KEY environment variable is not set.");
-    }
-    process.env.API_KEY = process.env.GENAI_API_KEY;
+    throw new Error("API_KEY environment variable is not set.");
 }
 
-const ai = new GoogleGenerativeAI({ apiKey: process.env.API_KEY });
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 const MODEL_ID = 'gemini-2.5-flash-image-preview'; // aka "nano-banana"
 
 /**
@@ -66,11 +62,33 @@ app.post("/process", upload.any(), async (req, res, next) => {
         if (!sourceImageFile) throw badRequest("Missing required file: source_image");
         if (!referenceImageFile) throw badRequest("Missing required file: reference_image");
         
-        const sourceMaskFile = files.find(f => f.fieldname === 'source_mask_0');
-        const referenceMaskFile = files.find(f => f.fieldname === 'reference_mask_0');
+        // Build a map of masks by color to find a complete pair
+        const maskMap = new Map(); // color -> { source?: File, reference?: File }
+        for (const f of files) {
+            const match = /^(\w+)_mask_(\w+)$/.exec(f.fieldname);
+            if (!match) continue;
+            
+            const [, type, color] = match; // type is 'source' or 'reference'
+            if (!maskMap.has(color)) {
+                maskMap.set(color, {});
+            }
+            maskMap.get(color)[type] = f;
+        }
 
-        if (!sourceMaskFile) throw badRequest("Missing required file: source_mask_0");
-        if (!referenceMaskFile) throw badRequest("Missing required file: reference_mask_0");
+        // Find the first complete pair
+        let sourceMaskFile = null;
+        let referenceMaskFile = null;
+        for (const pair of maskMap.values()) {
+            if (pair.source && pair.reference) {
+                sourceMaskFile = pair.source;
+                referenceMaskFile = pair.reference;
+                break; // Use the first complete pair we find
+            }
+        }
+
+        if (!sourceMaskFile || !referenceMaskFile) {
+            throw badRequest("No complete mask pair found. A pair requires both a source and reference mask for the same color (e.g., source_mask_red and reference_mask_red).");
+        }
             
         // 2. === Image Preparation ===
         console.log("Normalizing images to PNG...");
