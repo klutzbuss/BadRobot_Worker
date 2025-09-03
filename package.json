@@ -11,6 +11,6 @@
     "cors": "^2.8.5",
     "sharp": "^0.33.3",
     "@img/sharp-linux-x64": "^0.33.3",
-    "@google/genai": "^0.7.1"
+    "@google/generative-ai": "^0.17.0"
   }
 }

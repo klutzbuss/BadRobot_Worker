@@ -7,7 +7,7 @@ import express from "express";
 import multer from "multer";
 import cors from "cors";
 import sharp from "sharp";
-import { GoogleGenAI, Modality } from "@google/genai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const app = express();
 app.use(cors());
@@ -33,10 +33,14 @@ const upload = multer({
 
 // --- Gemini AI Setup ---
 if (!process.env.API_KEY) {
-    throw new Error("API_KEY environment variable is not set.");
+    // Fallback to the key name from the prompt for compatibility, but prefer the standard name.
+    if (!process.env.GENAI_API_KEY) {
+        throw new Error("API_KEY or GENAI_API_KEY environment variable is not set.");
+    }
+    process.env.API_KEY = process.env.GENAI_API_KEY;
 }
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+const ai = new GoogleGenerativeAI({ apiKey: process.env.API_KEY });
 const MODEL_ID = 'gemini-2.5-flash-image-preview'; // aka "nano-banana"
 
 /**
@@ -135,9 +139,6 @@ app.post("/process", upload.any(), async (req, res, next) => {
         const response = await ai.models.generateContent({
             model: MODEL_ID,
             contents: { parts },
-            config: {
-                responseModalities: [Modality.IMAGE, Modality.TEXT],
-            },
         });
         console.log("Model response received.");
 
